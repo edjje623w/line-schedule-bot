@@ -28,11 +28,6 @@ ALL_USER_IDS = [USER_ID_1, USER_ID_2]
 
 DB_PATH = "schedules.db"
 
-# ── 對話狀態（記錄使用者目前在哪個流程）────────────────────────────
-# state[user_id] = {
-#   "step": "wait_category" | "wait_delete" | "wait_conflict_confirm",
-#   "data": { ... }
-# }
 user_state = {}
 
 # ── 資料庫 ───────────────────────────────────────────────────────────
@@ -77,7 +72,6 @@ def format_date(d):
     return f"{d.month}/{d.day}（週{weekday_str(d)}）"
 
 def format_row_for_list(row):
-    """查詢時用：顯示時間、事項，有網址加🔗"""
     event_time = row[4]
     description = row[5]
     url = row[6]
@@ -86,7 +80,6 @@ def format_row_for_list(row):
     return f"{time_str}{description}{url_str}"
 
 def format_row_for_reminder(row):
-    """提醒時用：顯示時間、事項，有網址顯示完整"""
     event_time = row[4]
     description = row[5]
     url = row[6]
@@ -102,13 +95,11 @@ def parse_schedule(text):
     event_time = None
     url = None
 
-    # 抽出網址
     url_match = re.search(r'https?://\S+', text)
     if url_match:
         url = url_match.group(0)
         text = text[:url_match.start()].strip()
 
-    # 相對日期
     relative = {"今天": 0, "明天": 1, "後天": 2, "大後天": 3}
     for word, delta in relative.items():
         if text.startswith(word):
@@ -116,7 +107,6 @@ def parse_schedule(text):
             text = text[len(word):].strip()
             break
 
-    # 絕對日期
     if event_date is None:
         m = re.match(r"^(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})\s*", text)
         if m:
@@ -134,11 +124,9 @@ def parse_schedule(text):
     if event_date is None:
         return None
 
-    # 過去日期檢查
     if event_date < today:
         return {"error": "past"}
 
-    # 時間
     time_patterns = [
         (r"^(下午|晚上)\s*(\d{1,2})[點::](\d{2})\s*", lambda m: (int(m.group(2)) + 12 if int(m.group(2)) < 12 else int(m.group(2)), int(m.group(3)))),
         (r"^(下午|晚上)\s*(\d{1,2})\s*點\s*", lambda m: (int(m.group(2)) + 12 if int(m.group(2)) < 12 else int(m.group(2)), 0)),
@@ -187,11 +175,9 @@ def get_schedules(start_date, end_date, owner=None):
     return rows
 
 def format_schedule_list(rows, title):
-    """分人顯示，沒行程的人不出現，共同排最後"""
     if not rows:
         return f"📅 {title}\n\n（這段時間沒有行程）"
 
-    # 分組
     groups = {USER_NAME_1: [], USER_NAME_2: [], "共同": []}
     for row in rows:
         owner = row[1]
@@ -209,7 +195,7 @@ def format_schedule_list(rows, title):
     lines = [f"📅 {title}\n"]
     for name in [USER_NAME_1, USER_NAME_2]:
         if groups[name]:
-            lines.append(f"{name}")
+            lines.append(name)
             lines.extend(groups[name])
             lines.append("")
     if groups["共同"]:
@@ -220,13 +206,12 @@ def format_schedule_list(rows, title):
     return "\n".join(lines).strip()
 
 # ── 衝突檢查 ─────────────────────────────────────────────────────────
-def check_conflict(owner_id, event_date, event_time):
-    """只檢查共同行程跟對方的行程是否衝突"""
+def check_conflict(user_id, event_date, event_time):
     if not event_time:
         return None
     conn = get_conn()
     c = conn.cursor()
-    other_id = get_other_id(owner_id)
+    other_id = get_other_id(user_id)
     c.execute("""
         SELECT * FROM schedules
         WHERE owner = ? AND event_date = ? AND event_time = ?
@@ -248,25 +233,44 @@ def save_schedule(owner_id, category, parsed, created_by):
     conn.commit()
     conn.close()
 
+def do_save(created_by, owner_id, category, parsed, owner_name):
+    save_schedule(owner_id, category, parsed, created_by)
+
+    d = datetime.strptime(parsed["date"], "%Y-%m-%d").date()
+    time_str = f" {parsed['time']}" if parsed["time"] else ""
+    url_str = f"\n🔗 {parsed['url']}" if parsed.get("url") else ""
+
+    if category == "共同":
+        confirm = f"✅ 已新增共同行程\n{format_date(d)}{time_str} {parsed['description']}{url_str}"
+        creator_name = get_user_name(created_by)
+        notify_msg = f"📅 {creator_name}新增了共同行程\n{format_date(d)}{time_str} {parsed['description']}{url_str}"
+        other_id = get_other_id(created_by)
+        if other_id:
+            try:
+                line_bot_api.push_message(other_id, TextSendMessage(text=notify_msg))
+            except Exception as e:
+                print(f"Notify error: {e}")
+        return confirm
+    else:
+        return f"✅ 已新增{owner_name}行程\n{format_date(d)}{time_str} {parsed['description']}{url_str}"
+
 # ── 主訊息處理 ────────────────────────────────────────────────────────
 def handle_message(user_id, text):
     text = text.strip()
     today = date.today()
 
-    # ── 狀態機：等待中的流程 ──────────────────────────────────────────
+    # ── 狀態機 ────────────────────────────────────────────────────────
     if user_id in user_state:
         state = user_state[user_id]
 
-        # 等待選分類
+        # 等待是否共同行程
         if state["step"] == "wait_category":
-            if text in ["1", "2", "3"]:
-                cat_map = {"1": "自己", "2": "工作", "3": "共同"}
-                category = cat_map[text]
-                data = state["data"]
+            data = state["data"]
+            if text == "1":
                 del user_state[user_id]
-
-                # 共同行程：檢查衝突
-                if category == "共同" and data["parsed"]["time"]:
+                category = "共同"
+                # 檢查衝突
+                if data["parsed"]["time"]:
                     conflict = check_conflict(data["owner_id"], data["parsed"]["date"], data["parsed"]["time"])
                     if conflict:
                         other_name = get_user_name(get_other_id(user_id))
@@ -274,13 +278,14 @@ def handle_message(user_id, text):
                             "step": "wait_conflict_confirm",
                             "data": {**data, "category": category}
                         }
-                        d = datetime.strptime(data["parsed"]["date"], "%Y-%m-%d").date()
                         return (
                             f"⚠️ 注意：{other_name}在 {data['parsed']['date']} {data['parsed']['time']} 已有「{conflict[5]}」\n"
                             f"仍要新增共同行程嗎？\n1. 是\n2. 否"
                         )
-
-                return do_save(user_id, data["owner_id"], category, data["parsed"], data["owner_name"])
+                return do_save(user_id, data["owner_id"], "共同", data["parsed"], data["owner_name"])
+            elif text == "2":
+                del user_state[user_id]
+                return do_save(user_id, data["owner_id"], "個人", data["parsed"], data["owner_name"])
             else:
                 del user_state[user_id]
                 return "已取消新增。"
@@ -349,10 +354,11 @@ def handle_message(user_id, text):
         lines = ["請選擇要刪除哪筆行程：\n"]
         for i, row in enumerate(rows, 1):
             owner_name = get_user_name(row[1])
-            cat = row[2]
+            cat = "共同" if row[2] == "共同" else ""
+            cat_str = f"（{cat}）" if cat else ""
             d = datetime.strptime(row[3], "%Y-%m-%d").date()
             time_str = f" {row[4]}" if row[4] else ""
-            lines.append(f"{i}. {owner_name}｜{format_date(d)}{time_str} {row[5]}（{cat}）")
+            lines.append(f"{i}. {owner_name}｜{format_date(d)}{time_str} {row[5]}{cat_str}")
         lines.append("\n輸入數字選擇，其他輸入取消")
         return "\n".join(lines)
 
@@ -361,7 +367,6 @@ def handle_message(user_id, text):
         return get_help_text()
 
     # ── 解析新增行程 ──────────────────────────────────────────────────
-    # 檢查是否幫對方新增
     owner_id = user_id
     owner_name = get_user_name(user_id)
 
@@ -372,20 +377,6 @@ def handle_message(user_id, text):
             text = text[len(name):].strip()
             break
 
-    # 共同行程
-    if text.startswith("共同 ") or text.startswith("共同　"):
-        text = text[2:].strip()
-        parsed = parse_schedule(text)
-        if parsed:
-            if "error" in parsed and parsed["error"] == "past":
-                return "❌ 這個日期已經過去了，請重新輸入。"
-            user_state[user_id] = {
-                "step": "wait_category",
-                "data": {"owner_id": "共同", "owner_name": "共同", "parsed": parsed}
-            }
-            # 直接存共同
-            return do_save(user_id, "共同", "共同", parsed, "共同")
-
     parsed = parse_schedule(text)
     if parsed:
         if "error" in parsed and parsed["error"] == "past":
@@ -394,40 +385,16 @@ def handle_message(user_id, text):
             "step": "wait_category",
             "data": {"owner_id": owner_id, "owner_name": owner_name, "parsed": parsed}
         }
-        return "請選擇分類：\n1. 自己\n2. 工作\n3. 共同"
+        return "這是共同行程嗎？\n1. 是\n2. 否"
 
     return (
         "😅 我看不太懂，試試這樣輸入：\n\n"
         "7/15 11:00 染頭髮\n"
         "明天 下午3點 看牙醫\n"
         "阿虎 7/20 開會\n"
-        "共同 7/25 19:00 吃晚餐\n\n"
+        "7/15 10:00 繳費 https://xxx.com\n\n"
         "輸入「幫助」查看完整指令"
     )
-
-def do_save(created_by, owner_id, category, parsed, owner_name):
-    """實際存入資料庫，並處理共同行程通知"""
-    save_schedule(owner_id, category, parsed, created_by)
-
-    d = datetime.strptime(parsed["date"], "%Y-%m-%d").date()
-    time_str = f" {parsed['time']}" if parsed["time"] else ""
-    url_str = f"\n🔗 {parsed['url']}" if parsed.get("url") else ""
-
-    if category == "共同":
-        confirm = f"✅ 已新增共同行程\n{format_date(d)}{time_str} {parsed['description']}{url_str}"
-        # 通知對方
-        creator_name = get_user_name(created_by)
-        notify_msg = f"📅 {creator_name}新增了共同行程\n{format_date(d)}{time_str} {parsed['description']}{url_str}"
-        other_id = get_other_id(created_by)
-        if other_id:
-            try:
-                line_bot_api.push_message(other_id, TextSendMessage(text=notify_msg))
-            except Exception as e:
-                print(f"Notify error: {e}")
-        return confirm
-    else:
-        display_name = owner_name if owner_id != created_by else get_user_name(created_by)
-        return f"✅ 已新增{display_name}行程\n{format_date(d)}{time_str} {parsed['description']}{url_str}"
 
 def get_help_text():
     return (
@@ -436,10 +403,8 @@ def get_help_text():
         "  7/15 11:00 染頭髮\n"
         "  明天 下午3點 看牙醫\n"
         "  後天 買生日禮物\n"
-        "  阿虎 7/20 開會（幫對方新增）\n"
-        "  共同 7/25 19:00 吃晚餐\n"
+        f"  {USER_NAME_2} 7/20 開會（幫對方新增）\n"
         "  7/15 10:00 繳費 https://xxx.com\n\n"
-        "【分類】新增後選 1自己／2工作／3共同\n\n"
         "【查詢】\n"
         "  明天行程 / 本週行程 / 本月行程\n"
         f"  {USER_NAME_1}行程 / {USER_NAME_2}行程\n\n"
@@ -478,7 +443,6 @@ def reminder_loop():
         time.sleep(600)
 
 def build_reminder_msg(rows, recipient_id):
-    """建立提醒訊息，收到的人自己排最前，對方其次，共同最後"""
     if not rows:
         return None
 
@@ -530,9 +494,8 @@ def send_reminders():
             for uid in ALL_USER_IDS:
                 msg = build_reminder_msg(rows, uid)
                 if msg:
-                    full_msg = f"明天行程提醒\n\n{msg}"
                     try:
-                        line_bot_api.push_message(uid, TextSendMessage(text=full_msg))
+                        line_bot_api.push_message(uid, TextSendMessage(text=f"明天行程提醒\n\n{msg}"))
                     except Exception as e:
                         print(f"Push error: {e}")
             for row in rows:
@@ -547,9 +510,8 @@ def send_reminders():
             for uid in ALL_USER_IDS:
                 msg = build_reminder_msg(rows, uid)
                 if msg:
-                    full_msg = f"今天行程提醒\n\n{msg}"
                     try:
-                        line_bot_api.push_message(uid, TextSendMessage(text=full_msg))
+                        line_bot_api.push_message(uid, TextSendMessage(text=f"今天行程提醒\n\n{msg}"))
                     except Exception as e:
                         print(f"Push error: {e}")
             for row in rows:
