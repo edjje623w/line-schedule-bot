@@ -32,24 +32,16 @@ user_state = {}
 def get_conn():
     url = urlparse(DATABASE_URL)
     return pg8000.native.Connection(
-        user=url.username,
-        password=url.password,
-        host=url.hostname,
-        port=url.port or 5432,
-        database=url.path.lstrip("/"),
-        ssl_context=True
+        user=url.username, password=url.password,
+        host=url.hostname, port=url.port or 5432,
+        database=url.path.lstrip("/"), ssl_context=True
     )
 
 def db_run(sql, params=None, fetch=False):
     conn = get_conn()
     try:
-        if params:
-            result = conn.run(sql, *params)
-        else:
-            result = conn.run(sql)
-        if fetch:
-            return result
-        return None
+        result = conn.run(sql, *params) if params else conn.run(sql)
+        return result if fetch else None
     finally:
         conn.close()
 
@@ -94,7 +86,6 @@ def format_date_range(d_start, d_end):
     return format_date(d_start)
 
 def fmt_list(row):
-    # row: (id, owner, category, event_date, event_date_end, event_time, description, url, ...)
     d_start = datetime.strptime(row[3], "%Y-%m-%d").date()
     d_end = datetime.strptime(row[4], "%Y-%m-%d").date() if row[4] else None
     date_str = format_date_range(d_start, d_end)
@@ -132,7 +123,7 @@ def parse_schedule(text):
         url = url_match.group(0)
         text = text[:url_match.start()].strip()
 
-    # 連續日期 6/13-20 或 6/13到20
+    # 連續日期
     range_match = re.match(r'^(\d{1,2})[/\-](\d{1,2})\s*[到\-～~]\s*(\d{1,2})\s*', text)
     if range_match:
         month, day_s, day_e = int(range_match.group(1)), int(range_match.group(2)), int(range_match.group(3))
@@ -173,11 +164,11 @@ def parse_schedule(text):
 
     event_time = None
     for pattern, extractor in [
-        (r"^(下午|晚上)\s*(\d{1,2})[點::](\d{2})\s*", lambda m: (int(m.group(2))+12 if int(m.group(2))<12 else int(m.group(2)), int(m.group(3)))),
+        (r"^(下午|晚上)\s*(\d{1,2})[點:：](\d{2})\s*", lambda m: (int(m.group(2))+12 if int(m.group(2))<12 else int(m.group(2)), int(m.group(3)))),
         (r"^(下午|晚上)\s*(\d{1,2})\s*點\s*", lambda m: (int(m.group(2))+12 if int(m.group(2))<12 else int(m.group(2)), 0)),
-        (r"^(早上|上午|早)\s*(\d{1,2})[點::](\d{2})\s*", lambda m: (int(m.group(2)), int(m.group(3)))),
+        (r"^(早上|上午|早)\s*(\d{1,2})[點:：](\d{2})\s*", lambda m: (int(m.group(2)), int(m.group(3)))),
         (r"^(早上|上午|早)\s*(\d{1,2})\s*點\s*", lambda m: (int(m.group(2)), 0)),
-        (r"^(\d{1,2})[::點](\d{2})\s*", lambda m: (int(m.group(1)), int(m.group(2)))),
+        (r"^(\d{1,2})[::：點](\d{2})\s*", lambda m: (int(m.group(1)), int(m.group(2)))),
         (r"^(\d{1,2})\s*點(\d{2})?\s*", lambda m: (int(m.group(1)), int(m.group(2)) if m.group(2) else 0)),
         (r"^(\d{1,2})\s*(?=[\u4e00-\u9fff])", lambda m: (int(m.group(1)), 0) if 0 <= int(m.group(1)) <= 23 else None),
     ]:
@@ -193,18 +184,40 @@ def parse_schedule(text):
     if not desc: return None
     return {"date": event_date.strftime("%Y-%m-%d"), "date_end": None, "time": event_time, "description": desc, "url": url}
 
+# ── 多行解析 ─────────────────────────────────────────────────────────
+def parse_multi(text, default_owner_id, default_owner_name):
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    results = []
+    errors = []
+    for line in lines:
+        owner_id = default_owner_id
+        owner_name = default_owner_name
+        for uid, name in USER_NAMES.items():
+            if line.startswith(name+" ") or line.startswith(name+"　"):
+                owner_id = uid
+                owner_name = name
+                line = line[len(name):].strip()
+                break
+        parsed = parse_schedule(line)
+        if parsed:
+            if parsed.get("error") == "past":
+                errors.append(f"❌ 日期已過：{line}")
+            else:
+                results.append({"owner_id": owner_id, "owner_name": owner_name, "parsed": parsed})
+        else:
+            errors.append(f"❓ 看不懂：{line}")
+    return results, errors
+
 # ── 查詢行程 ──────────────────────────────────────────────────────────
 def get_schedules(start_date, end_date, owner=None):
     if owner:
         rows = db_run(
             "SELECT * FROM schedules WHERE event_date <= :1 AND (event_date_end >= :2 OR (event_date_end IS NULL AND event_date >= :3)) AND owner = :4 ORDER BY event_date, event_time NULLS LAST",
-            (end_date, start_date, start_date, owner), fetch=True
-        )
+            (end_date, start_date, start_date, owner), fetch=True)
     else:
         rows = db_run(
             "SELECT * FROM schedules WHERE event_date <= :1 AND (event_date_end >= :2 OR (event_date_end IS NULL AND event_date >= :3)) ORDER BY event_date, event_time NULLS LAST",
-            (end_date, start_date, start_date), fetch=True
-        )
+            (end_date, start_date, start_date), fetch=True)
     return rows or []
 
 def format_list(rows, title):
@@ -213,22 +226,15 @@ def format_list(rows, title):
     groups = {USER_NAME_1: [], USER_NAME_2: [], "共同": []}
     for row in rows:
         line = fmt_list(row)
-        if row[2] == "共同":
-            groups["共同"].append(line)
-        elif row[1] == USER_ID_1:
-            groups[USER_NAME_1].append(line)
-        elif row[1] == USER_ID_2:
-            groups[USER_NAME_2].append(line)
+        if row[2] == "共同": groups["共同"].append(line)
+        elif row[1] == USER_ID_1: groups[USER_NAME_1].append(line)
+        elif row[1] == USER_ID_2: groups[USER_NAME_2].append(line)
     lines = [f"📅 {title}\n"]
     for name in [USER_NAME_1, USER_NAME_2]:
         if groups[name]:
-            lines.append(name)
-            lines.extend(groups[name])
-            lines.append("")
+            lines.append(name); lines.extend(groups[name]); lines.append("")
     if groups["共同"]:
-        lines.append(f"👫 {USER_NAME_1}+{USER_NAME_2}")
-        lines.extend(groups["共同"])
-        lines.append("")
+        lines.append(f"👫 {USER_NAME_1}+{USER_NAME_2}"); lines.extend(groups["共同"]); lines.append("")
     return "\n".join(lines).strip()
 
 def check_conflict(user_id, event_date, event_time):
@@ -245,7 +251,7 @@ def save_schedule(owner_id, category, parsed, created_by):
             parsed["time"], parsed["description"], parsed.get("url"),
             created_by, datetime.now().isoformat()))
 
-def do_save(created_by, owner_id, category, parsed, owner_name):
+def do_save_one(created_by, owner_id, category, parsed, owner_name):
     save_schedule(owner_id, category, parsed, created_by)
     d_s = datetime.strptime(parsed["date"], "%Y-%m-%d").date()
     d_e = datetime.strptime(parsed["date_end"], "%Y-%m-%d").date() if parsed.get("date_end") else None
@@ -253,7 +259,6 @@ def do_save(created_by, owner_id, category, parsed, owner_name):
     time_str = f" {parsed['time']}" if parsed["time"] else ""
     url_str = f"\n🔗 {parsed['url']}" if parsed.get("url") else ""
     if category == "共同":
-        confirm = f"✅ 已新增共同行程\n{date_str}{time_str} {parsed['description']}{url_str}"
         other_id = get_other_id(created_by)
         if other_id:
             try:
@@ -261,8 +266,8 @@ def do_save(created_by, owner_id, category, parsed, owner_name):
                     text=f"📅 {get_user_name(created_by)}新增了共同行程\n{date_str}{time_str} {parsed['description']}{url_str}"))
             except Exception as e:
                 print(f"Notify error: {e}")
-        return confirm
-    return f"✅ 已新增{owner_name}行程\n{date_str}{time_str} {parsed['description']}{url_str}"
+        return f"共同｜{date_str}{time_str} {parsed['description']}{url_str}"
+    return f"{owner_name}｜{date_str}{time_str} {parsed['description']}{url_str}"
 
 # ── 主訊息處理 ────────────────────────────────────────────────────────
 def handle_message(user_id, text):
@@ -271,29 +276,36 @@ def handle_message(user_id, text):
 
     if user_id in user_state:
         state = user_state[user_id]
+
         if state["step"] == "wait_category":
             data = state["data"]
             if text in ["是", "1"]:
                 del user_state[user_id]
-                if data["parsed"]["time"]:
-                    conflict = check_conflict(data["owner_id"], data["parsed"]["date"], data["parsed"]["time"])
-                    if conflict:
-                        user_state[user_id] = {"step": "wait_conflict_confirm", "data": {**data, "category": "共同"}}
-                        return (f"⚠️ 注意：{get_user_name(get_other_id(user_id))}在 {data['parsed']['date']} {data['parsed']['time']} 已有「{conflict[6]}」\n仍要新增共同行程嗎？", qr_yes_no())
-                return (do_save(user_id, data["owner_id"], "共同", data["parsed"], data["owner_name"]), None)
+                category = "共同"
+                items = data["items"]
+                saved = []
+                for item in items:
+                    if item["parsed"]["time"]:
+                        conflict = check_conflict(item["owner_id"], item["parsed"]["date"], item["parsed"]["time"])
+                        if conflict:
+                            # 有衝突還是存，但提示
+                            result = do_save_one(user_id, item["owner_id"], category, item["parsed"], item["owner_name"])
+                            saved.append(f"⚠️ {result}（與{get_user_name(get_other_id(user_id))}的行程衝突）")
+                            continue
+                    result = do_save_one(user_id, item["owner_id"], category, item["parsed"], item["owner_name"])
+                    saved.append(result)
+                return (f"✅ 已新增 {len(saved)} 筆共同行程\n\n" + "\n".join(saved), None)
             elif text in ["否", "2"]:
                 del user_state[user_id]
-                return (do_save(user_id, data["owner_id"], "個人", data["parsed"], data["owner_name"]), None)
+                items = data["items"]
+                saved = []
+                for item in items:
+                    result = do_save_one(user_id, item["owner_id"], "個人", item["parsed"], item["owner_name"])
+                    saved.append(result)
+                return (f"✅ 已新增 {len(saved)} 筆行程\n\n" + "\n".join(saved), None)
             else:
                 del user_state[user_id]
                 return ("已取消新增。", None)
-
-        if state["step"] == "wait_conflict_confirm":
-            data = state["data"]
-            del user_state[user_id]
-            if text in ["是", "1"]:
-                return (do_save(user_id, data["owner_id"], data["category"], data["parsed"], data["owner_name"]), None)
-            return ("已取消新增。", None)
 
         if state["step"] == "wait_delete":
             rows = state["data"]["rows"]
@@ -305,6 +317,7 @@ def handle_message(user_id, text):
             del user_state[user_id]
             return ("已取消刪除。", None)
 
+    # ── 查詢指令 ──────────────────────────────────────────────────────
     if any(kw in text for kw in ["明天行程", "查明天"]):
         tomorrow = today + timedelta(days=1)
         rows = get_schedules(tomorrow.strftime("%Y-%m-%d"), tomorrow.strftime("%Y-%m-%d"))
@@ -358,31 +371,40 @@ def handle_message(user_id, text):
     if text in ["幫助", "help", "?", "？", "說明", "指令"]:
         return (get_help_text(), None)
 
+    # ── 多行新增行程 ──────────────────────────────────────────────────
     owner_id = user_id
     owner_name = get_user_name(user_id)
-    for uid, name in USER_NAMES.items():
-        if text.startswith(name+" ") or text.startswith(name+"　"):
-            owner_id = uid
-            owner_name = name
-            text = text[len(name):].strip()
-            break
 
-    parsed = parse_schedule(text)
-    if parsed:
-        if parsed.get("error") == "past":
-            return ("❌ 這個日期已經過去了，請重新輸入。", None)
-        user_state[user_id] = {"step": "wait_category", "data": {"owner_id": owner_id, "owner_name": owner_name, "parsed": parsed}}
-        return ("這是共同行程嗎？", qr_yes_no())
+    results, errors = parse_multi(text, owner_id, owner_name)
+
+    if results:
+        # 預覽將新增的行程
+        preview_lines = []
+        for item in results:
+            p = item["parsed"]
+            d_s = datetime.strptime(p["date"], "%Y-%m-%d").date()
+            d_e = datetime.strptime(p["date_end"], "%Y-%m-%d").date() if p.get("date_end") else None
+            date_str = format_date_range(d_s, d_e)
+            time_str = f" {p['time']}" if p["time"] else ""
+            preview_lines.append(f"{item['owner_name']}｜{date_str}{time_str} {p['description']}")
+
+        error_msg = ""
+        if errors:
+            error_msg = "\n\n⚠️ 以下無法解析：\n" + "\n".join(errors)
+
+        user_state[user_id] = {"step": "wait_category", "data": {"items": results}}
+        preview = "\n".join(preview_lines)
+        return (f"準備新增以下行程：\n\n{preview}{error_msg}\n\n這些是共同行程嗎？", qr_yes_no())
 
     return ("😅 我看不太懂，試試這樣輸入：\n\n7/15 11:00 染頭髮\n7/15 11染頭髮\n明天 下午3點 看牙醫\n6/13-20 富國島\n"
-            f"{USER_NAME_2} 7/20 開會\n\n輸入「幫助」查看完整指令", None)
+            f"{USER_NAME_2} 7/20 開會\n\n可以一次輸入多行，每行一筆行程\n\n輸入「幫助」查看完整指令", None)
 
 def get_help_text():
-    return ("📖 使用說明\n\n【新增行程】\n  7/15 11:00 染頭髮\n  7/15 11染頭髮\n  明天 下午3點 看牙醫\n"
-            "  6/13-20 富國島（連續行程）\n  6/13到20 富國島\n"
+    return ("📖 使用說明\n\n【新增行程（可多行）】\n  7/15 11:00 染頭髮\n  7/15 11染頭髮\n  明天 下午3點 看牙醫\n"
+            "  6/13-20 富國島（連續行程）\n"
             f"  {USER_NAME_2} 7/20 開會（幫對方新增）\n  7/15 10:00 繳費 https://xxx.com\n\n"
             f"【查詢】\n  明天行程 / 本週行程\n  未來行程\n  {USER_NAME_1}行程 / {USER_NAME_2}行程\n  我的 / 他的\n\n"
-            "【刪除】輸入「刪除」選擇要刪的行程\n\n【提醒時間】\n  3天前晚上（超過7天的行程）\n  前一天晚上 11 點\n  當天早上 9 點")
+            "【刪除】輸入「刪除」選擇要刪的行程\n\n【提醒時間】\n  3天前（超過7天的行程）\n  前一天晚上 11 點\n  當天早上 9 點")
 
 # ── Webhook ──────────────────────────────────────────────────────────
 @app.route("/callback", methods=["POST"])
@@ -429,22 +451,17 @@ def send_reminders():
     tomorrow = today + timedelta(days=1)
     three_days_later = today + timedelta(days=3)
 
-    # 三天前提醒（晚上 23 點）
     if now.hour == 23 and now.minute < 10:
         rows = db_run("SELECT * FROM schedules WHERE event_date = :1 AND reminded_three_days = 0 AND (event_date::date - :2::date) > 7 ORDER BY event_time NULLS LAST",
                       (three_days_later.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")), fetch=True) or []
         for row in rows:
             line = fmt_reminder(row)
-            if row[2] == "共同":
-                msg = f"⏰ 3天後行程提醒\n\n👫 {USER_NAME_1}+{USER_NAME_2}\n{line}"
-            else:
-                msg = f"⏰ 3天後行程提醒\n\n{get_user_name(row[1])}\n{line}"
+            msg = f"⏰ 3天後行程提醒\n\n{'👫 '+USER_NAME_1+'+'+USER_NAME_2 if row[2]=='共同' else get_user_name(row[1])}\n{line}"
             for uid in ALL_USER_IDS:
                 try: line_bot_api.push_message(uid, TextSendMessage(text=msg))
                 except Exception as e: print(f"Push error: {e}")
             db_run("UPDATE schedules SET reminded_three_days = 1 WHERE id = :1", (row[0],))
 
-    # 前一天晚上 23 點
     if now.hour == 23 and now.minute < 10:
         rows = db_run("SELECT * FROM schedules WHERE event_date = :1 AND reminded_day_before = 0 ORDER BY event_time NULLS LAST",
                       (tomorrow.strftime("%Y-%m-%d"),), fetch=True) or []
@@ -457,7 +474,6 @@ def send_reminders():
             for row in rows:
                 db_run("UPDATE schedules SET reminded_day_before = 1 WHERE id = :1", (row[0],))
 
-    # 當天早上 9 點
     if now.hour == 9 and now.minute < 10:
         rows = db_run("SELECT * FROM schedules WHERE event_date = :1 AND reminded_same_day = 0 ORDER BY event_time NULLS LAST",
                       (today.strftime("%Y-%m-%d"),), fetch=True) or []
