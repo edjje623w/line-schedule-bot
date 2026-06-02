@@ -41,11 +41,11 @@ def db_run(sql, params=None, fetch=False):
     conn = get_conn()
     try:
         if params:
-            # Convert positional :1,:2,... to named $1,$2,... style for pg8000
+            # pg8000 uses :param_name syntax with keyword args
             named_sql = sql
             named_params = {}
             for i, val in enumerate(params, 1):
-                named_sql = named_sql.replace(f":{i}", f"$p{i}")
+                named_sql = named_sql.replace(f":{i}", f":p{i}")
                 named_params[f"p{i}"] = val
             result = conn.run(named_sql, **named_params)
         else:
