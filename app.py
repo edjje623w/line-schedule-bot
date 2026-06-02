@@ -40,7 +40,16 @@ def get_conn():
 def db_run(sql, params=None, fetch=False):
     conn = get_conn()
     try:
-        result = conn.run(sql, *params) if params else conn.run(sql)
+        if params:
+            # Convert positional :1,:2,... to named $1,$2,... style for pg8000
+            named_sql = sql
+            named_params = {}
+            for i, val in enumerate(params, 1):
+                named_sql = named_sql.replace(f":{i}", f"$p{i}")
+                named_params[f"p{i}"] = val
+            result = conn.run(named_sql, **named_params)
+        else:
+            result = conn.run(sql)
         return result if fetch else None
     finally:
         conn.close()
