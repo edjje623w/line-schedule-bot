@@ -1,6 +1,5 @@
 import os
 import re
-import sqlite3
 from datetime import datetime, date, timedelta
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
@@ -11,6 +10,8 @@ from linebot.models import (
 )
 import threading
 import time
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
 
@@ -21,6 +22,7 @@ USER_ID_1 = os.environ.get("USER_ID_1", "USER_ID_1")
 USER_ID_2 = os.environ.get("USER_ID_2", "USER_ID_2")
 USER_NAME_1 = os.environ.get("USER_NAME_1", "阿馨")
 USER_NAME_2 = os.environ.get("USER_NAME_2", "阿虎")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 USER_NAMES = {
     USER_ID_1: USER_NAME_1,
@@ -28,16 +30,18 @@ USER_NAMES = {
 }
 
 ALL_USER_IDS = [USER_ID_1, USER_ID_2]
-DB_PATH = "schedules.db"
 user_state = {}
 
 # ── 資料庫 ───────────────────────────────────────────────────────────
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS schedules (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             owner TEXT NOT NULL,
             category TEXT NOT NULL,
             event_date TEXT NOT NULL,
@@ -48,14 +52,13 @@ def init_db():
             created_by TEXT NOT NULL,
             created_at TEXT NOT NULL,
             reminded_day_before INTEGER DEFAULT 0,
-            reminded_same_day INTEGER DEFAULT 0
+            reminded_same_day INTEGER DEFAULT 0,
+            reminded_three_days INTEGER DEFAULT 0
         )
     """)
     conn.commit()
+    c.close()
     conn.close()
-
-def get_conn():
-    return sqlite3.connect(DB_PATH)
 
 # ── 工具函式 ─────────────────────────────────────────────────────────
 def get_user_name(user_id):
@@ -78,7 +81,14 @@ def format_date_range(d_start, d_end):
         return f"{d_start.month}/{d_start.day}（週{weekday_str(d_start)}）－{d_end.month}/{d_end.day}（週{weekday_str(d_end)}）"
     return format_date(d_start)
 
+def row_to_tuple(row):
+    """Convert psycopg2 row to tuple for consistent access"""
+    if isinstance(row, dict):
+        return tuple(row.values())
+    return row
+
 def format_row_for_list(row):
+    row = row_to_tuple(row)
     event_date = row[3]
     event_date_end = row[4]
     event_time = row[5]
@@ -92,6 +102,7 @@ def format_row_for_list(row):
     return f"{date_str}{time_str} {description}{url_str}"
 
 def format_row_for_reminder(row):
+    row = row_to_tuple(row)
     event_date = row[3]
     event_date_end = row[4]
     event_time = row[5]
@@ -111,7 +122,8 @@ def quick_reply_yes_no():
     ])
 
 def quick_reply_numbers(n):
-    items = [QuickReplyButton(action=MessageAction(label=str(i), text=str(i))) for i in range(1, min(n+1, 14))]
+    items = [QuickReplyButton(action=MessageAction(label=str(i), text=str(i))) for i in range(1, min(n+1, 12))]
+    items.append(QuickReplyButton(action=MessageAction(label="取消", text="取消")))
     return QuickReply(items=items)
 
 # ── 解析日期時間 ──────────────────────────────────────────────────────
@@ -123,13 +135,12 @@ def parse_schedule(text):
     event_time = None
     url = None
 
-    # 抽出網址
     url_match = re.search(r'https?://\S+', text)
     if url_match:
         url = url_match.group(0)
         text = text[:url_match.start()].strip()
 
-    # 連續日期：6/13到20、6/13-20、6/13～20
+    # 連續日期
     range_match = re.match(r'^(\d{1,2})[/\-](\d{1,2})\s*[到\-～~]\s*(\d{1,2})\s*', text)
     if range_match:
         month = int(range_match.group(1))
@@ -142,8 +153,7 @@ def parse_schedule(text):
         else:
             event_date_end = date(year, month, day_end)
         text = text[range_match.end():].strip()
-        description = text.strip()
-        if not description:
+        if not text:
             return None
         if event_date < today:
             return {"error": "past"}
@@ -151,7 +161,7 @@ def parse_schedule(text):
             "date": event_date.strftime("%Y-%m-%d"),
             "date_end": event_date_end.strftime("%Y-%m-%d"),
             "time": None,
-            "description": description,
+            "description": text,
             "url": url,
         }
 
@@ -184,7 +194,7 @@ def parse_schedule(text):
     if event_date < today:
         return {"error": "past"}
 
-    # 時間解析（支援無空格如 11染頭髮、9看牙醫）
+    # 時間解析
     time_patterns = [
         (r"^(下午|晚上)\s*(\d{1,2})[點::](\d{2})\s*", lambda m: (int(m.group(2)) + 12 if int(m.group(2)) < 12 else int(m.group(2)), int(m.group(3)))),
         (r"^(下午|晚上)\s*(\d{1,2})\s*點\s*", lambda m: (int(m.group(2)) + 12 if int(m.group(2)) < 12 else int(m.group(2)), 0)),
@@ -192,7 +202,6 @@ def parse_schedule(text):
         (r"^(早上|上午|早)\s*(\d{1,2})\s*點\s*", lambda m: (int(m.group(2)), 0)),
         (r"^(\d{1,2})[::點](\d{2})\s*", lambda m: (int(m.group(1)), int(m.group(2)))),
         (r"^(\d{1,2})\s*點(\d{2})?\s*", lambda m: (int(m.group(1)), int(m.group(2)) if m.group(2) else 0)),
-        # 純數字後接空格或中文（無空格也支援）
         (r"^(\d{1,2})\s*(?=[\u4e00-\u9fff])", lambda m: (int(m.group(1)), 0) if 0 <= int(m.group(1)) <= 23 else None),
     ]
     for pattern, extractor in time_patterns:
@@ -226,17 +235,18 @@ def get_schedules(start_date, end_date, owner=None):
     if owner:
         c.execute("""
             SELECT * FROM schedules
-            WHERE event_date <= ? AND (event_date_end >= ? OR (event_date_end IS NULL AND event_date >= ?))
-            AND owner = ?
+            WHERE event_date <= %s AND (event_date_end >= %s OR (event_date_end IS NULL AND event_date >= %s))
+            AND owner = %s
             ORDER BY event_date, event_time NULLS LAST
         """, (end_date, start_date, start_date, owner))
     else:
         c.execute("""
             SELECT * FROM schedules
-            WHERE event_date <= ? AND (event_date_end >= ? OR (event_date_end IS NULL AND event_date >= ?))
+            WHERE event_date <= %s AND (event_date_end >= %s OR (event_date_end IS NULL AND event_date >= %s))
             ORDER BY event_date, event_time NULLS LAST
         """, (end_date, start_date, start_date))
     rows = c.fetchall()
+    c.close()
     conn.close()
     return rows
 
@@ -246,6 +256,7 @@ def format_schedule_list(rows, title):
 
     groups = {USER_NAME_1: [], USER_NAME_2: [], "共同": []}
     for row in rows:
+        row = row_to_tuple(row)
         owner = row[1]
         category = row[2]
         line = format_row_for_list(row)
@@ -263,7 +274,7 @@ def format_schedule_list(rows, title):
             lines.extend(groups[name])
             lines.append("")
     if groups["共同"]:
-        lines.append(f"💑 {USER_NAME_1}+{USER_NAME_2}")
+        lines.append(f"👫 {USER_NAME_1}+{USER_NAME_2}")
         lines.extend(groups["共同"])
         lines.append("")
 
@@ -278,9 +289,10 @@ def check_conflict(user_id, event_date, event_time):
     other_id = get_other_id(user_id)
     c.execute("""
         SELECT * FROM schedules
-        WHERE owner = ? AND event_date = ? AND event_time = ?
+        WHERE owner = %s AND event_date = %s AND event_time = %s
     """, (other_id, event_date, event_time))
     row = c.fetchone()
+    c.close()
     conn.close()
     return row
 
@@ -290,11 +302,12 @@ def save_schedule(owner_id, category, parsed, created_by):
     c.execute("""
         INSERT INTO schedules
         (owner, category, event_date, event_date_end, event_time, description, url, created_by, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (owner_id, category, parsed["date"], parsed.get("date_end"),
           parsed["time"], parsed["description"], parsed.get("url"),
           created_by, datetime.now().isoformat()))
     conn.commit()
+    c.close()
     conn.close()
 
 def do_save(created_by, owner_id, category, parsed, owner_name):
@@ -335,6 +348,7 @@ def handle_message(user_id, text):
                 if data["parsed"]["time"]:
                     conflict = check_conflict(data["owner_id"], data["parsed"]["date"], data["parsed"]["time"])
                     if conflict:
+                        conflict = row_to_tuple(conflict)
                         other_name = get_user_name(get_other_id(user_id))
                         user_state[user_id] = {
                             "step": "wait_conflict_confirm",
@@ -363,11 +377,12 @@ def handle_message(user_id, text):
         if state["step"] == "wait_delete":
             rows = state["data"]["rows"]
             if text.isdigit() and 1 <= int(text) <= len(rows):
-                row = rows[int(text) - 1]
+                row = row_to_tuple(rows[int(text) - 1])
                 conn = get_conn()
                 c = conn.cursor()
-                c.execute("DELETE FROM schedules WHERE id = ?", (row[0],))
+                c.execute("DELETE FROM schedules WHERE id = %s", (row[0],))
                 conn.commit()
+                c.close()
                 conn.close()
                 del user_state[user_id]
                 return (f"✅ 已刪除\n{format_row_for_list(row)}", None)
@@ -423,6 +438,7 @@ def handle_message(user_id, text):
         user_state[user_id] = {"step": "wait_delete", "data": {"rows": rows}}
         lines = ["請選擇要刪除哪筆行程：\n"]
         for i, row in enumerate(rows, 1):
+            row = row_to_tuple(row)
             owner_name = get_user_name(row[1])
             cat_str = "（共同）" if row[2] == "共同" else ""
             lines.append(f"{i}. {owner_name}｜{format_row_for_list(row)}{cat_str}")
@@ -482,6 +498,7 @@ def get_help_text():
         "  我的 / 他的\n\n"
         "【刪除】輸入「刪除」選擇要刪的行程\n\n"
         "【提醒時間】\n"
+        "  3天前晚上（超過7天以上的行程）\n"
         "  前一天晚上 11 點\n"
         "  當天早上 9 點"
     )
@@ -524,6 +541,7 @@ def build_reminder_msg(rows, recipient_id):
     other_name = get_user_name(other_id)
     groups = {recipient_name: [], other_name: [], "共同": []}
     for row in rows:
+        row = row_to_tuple(row)
         owner = row[1]
         category = row[2]
         line = format_row_for_reminder(row)
@@ -543,7 +561,7 @@ def build_reminder_msg(rows, recipient_id):
             lines.extend(groups[name])
             lines.append("")
     if groups["共同"]:
-        lines.append(f"💑 {USER_NAME_1}+{USER_NAME_2}")
+        lines.append(f"👫 {USER_NAME_1}+{USER_NAME_2}")
         lines.extend(groups["共同"])
         lines.append("")
     return "\n".join(lines).strip()
@@ -552,14 +570,41 @@ def send_reminders():
     now = datetime.now()
     today = date.today()
     tomorrow = today + timedelta(days=1)
+    three_days_later = today + timedelta(days=3)
     conn = get_conn()
     c = conn.cursor()
+
+    # 三天前提醒（晚上 23 點）
+    if now.hour == 23 and now.minute < 10:
+        c.execute("""
+            SELECT * FROM schedules
+            WHERE event_date = %s AND reminded_three_days = 0
+            AND (event_date::date - %s::date) > 7
+            ORDER BY event_time NULLS LAST
+        """, (three_days_later.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")))
+        rows = c.fetchall()
+        for row in rows:
+            row = row_to_tuple(row)
+            owner = row[1]
+            category = row[2]
+            line = format_row_for_reminder(row)
+            if category == "共同":
+                msg = f"⏰ 3天後行程提醒\n\n👫 {USER_NAME_1}+{USER_NAME_2}\n{line}"
+            else:
+                msg = f"⏰ 3天後行程提醒\n\n{get_user_name(owner)}\n{line}"
+            for uid in ALL_USER_IDS:
+                try:
+                    line_bot_api.push_message(uid, TextSendMessage(text=msg))
+                except Exception as e:
+                    print(f"Push error: {e}")
+            c.execute("UPDATE schedules SET reminded_three_days = 1 WHERE id = %s", (row[0],))
+        conn.commit()
 
     # 前一天晚上 23 點
     if now.hour == 23 and now.minute < 10:
         c.execute("""
             SELECT * FROM schedules
-            WHERE event_date = ? AND reminded_day_before = 0
+            WHERE event_date = %s AND reminded_day_before = 0
             ORDER BY event_time NULLS LAST
         """, (tomorrow.strftime("%Y-%m-%d"),))
         rows = c.fetchall()
@@ -568,18 +613,19 @@ def send_reminders():
                 msg = build_reminder_msg(rows, uid)
                 if msg:
                     try:
-                        line_bot_api.push_message(uid, TextSendMessage(text=f"明天行程提醒\n\n{msg}"))
+                        line_bot_api.push_message(uid, TextSendMessage(text=f"⏰ 明天行程提醒\n\n{msg}"))
                     except Exception as e:
                         print(f"Push error: {e}")
             for row in rows:
-                c.execute("UPDATE schedules SET reminded_day_before = 1 WHERE id = ?", (row[0],))
+                row = row_to_tuple(row)
+                c.execute("UPDATE schedules SET reminded_day_before = 1 WHERE id = %s", (row[0],))
             conn.commit()
 
     # 當天早上 9 點
     if now.hour == 9 and now.minute < 10:
         c.execute("""
             SELECT * FROM schedules
-            WHERE event_date = ? AND reminded_same_day = 0
+            WHERE event_date = %s AND reminded_same_day = 0
             ORDER BY event_time NULLS LAST
         """, (today.strftime("%Y-%m-%d"),))
         rows = c.fetchall()
@@ -588,13 +634,15 @@ def send_reminders():
                 msg = build_reminder_msg(rows, uid)
                 if msg:
                     try:
-                        line_bot_api.push_message(uid, TextSendMessage(text=f"今天行程提醒\n\n{msg}"))
+                        line_bot_api.push_message(uid, TextSendMessage(text=f"‼️別忘了今天要做的事‼️\n\n{msg}"))
                     except Exception as e:
                         print(f"Push error: {e}")
             for row in rows:
-                c.execute("UPDATE schedules SET reminded_same_day = 1 WHERE id = ?", (row[0],))
+                row = row_to_tuple(row)
+                c.execute("UPDATE schedules SET reminded_same_day = 1 WHERE id = %s", (row[0],))
             conn.commit()
 
+    c.close()
     conn.close()
 
 # ── 啟動 ──────────────────────────────────────────────────────────────
