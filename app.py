@@ -521,6 +521,11 @@ def send_reminders():
     conn.close()
 
 # ── 啟動 ──────────────────────────────────────────────────────────────
+# gunicorn 啟動時也會執行
+init_db()
+t = threading.Thread(target=reminder_loop, daemon=True)
+t.start()
+
 if __name__ == "__main__":
     init_db()
     t = threading.Thread(target=reminder_loop, daemon=True)
