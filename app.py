@@ -455,8 +455,10 @@ def build_reminder_msg(rows, recipient_id):
     return "\n".join(lines).strip()
 
 def send_reminders():
-    now = datetime.now()
-    today = date.today()
+    from datetime import timezone
+    tz_tw = timezone(timedelta(hours=8))
+    now = datetime.now(tz_tw)
+    today = now.date()
     tomorrow = today + timedelta(days=1)
     three_days_later = today + timedelta(days=3)
 
