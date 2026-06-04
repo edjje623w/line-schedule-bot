@@ -416,6 +416,10 @@ def get_help_text():
             "【刪除】輸入「刪除」選擇要刪的行程\n\n【提醒時間】\n  3天前（超過7天的行程）\n  前一天晚上 11 點\n  當天早上 9 點")
 
 # ── Webhook ──────────────────────────────────────────────────────────
+@app.route("/")
+def index():
+    return "OK", 200
+
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
